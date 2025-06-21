@@ -78,18 +78,6 @@ void cleanup();
 char* my_strdup(const char* s);
 double sum_Active_weights();
 
-int find_packet_by_appearance(PacketQueue *queue, int appearance_order);
-
-// Helper function to duplicate string (portable strdup)
-int find_packet_by_appearance(PacketQueue *queue, int appearance_order) {
-	for (int i = 0; i < queue->count; i++) {
-		if (queue->packets[i].appearance_order == appearance_order) {
-			return i;
-		}
-	}
-	return -1;
-}
-
 double sum_Active_weights() {
 	int num_active_ids = 0;
 	int active_conn_ids[MAX_FLOWS] = { 0 };
