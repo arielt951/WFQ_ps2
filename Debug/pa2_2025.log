@@ -1,2 +1,5 @@
 ﻿  WFQ.c
+c:\users\97250\documents\שנה ג\סמסטר ב\מבוא לרשתות מחשבים\pa2_2025\pa2_2025\wfq.c(266): warning C4244: '=': conversion from '__int64' to 'double', possible loss of data
+c:\users\97250\documents\שנה ג\סמסטר ב\מבוא לרשתות מחשבים\pa2_2025\pa2_2025\wfq.c(254): warning C4244: 'initializing': conversion from 'double' to '__int64', possible loss of data
+c:\users\97250\documents\שנה ג\סמסטר ב\מבוא לרשתות מחשבים\pa2_2025\pa2_2025\wfq.c(299): warning C4244: '=': conversion from '__int64' to 'double', possible loss of data
   pa2_2025.vcxproj -> C:\Users\97250\Documents\שנה ג\סמסטר ב\מבוא לרשתות מחשבים\pa2_2025\Debug\pa2_2025.exe

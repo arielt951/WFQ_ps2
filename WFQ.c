@@ -1,24 +1,116 @@
-﻿/*
- * Original WFQ Implementation with Simple Debug Output
- *
- * After each packet output, prints:
- * DEBUG: arrival_time=X, weight=Y, virtual_time=Z
- */
-
-#define _CRT_SECURE_NO_WARNINGS
+﻿#define _CRT_SECURE_NO_WARNINGS  // disable warning on strcpy/strtok, strdup
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
-#include <stdint.h>
 #include <math.h>
+#include <string.h>
+#include <float.h>
+#define MAX_IP_LEN 16
+#define LINE_BUFFER_SZ 512
+#define MAX_FLOWS 2048
+#define BUF_INITIAL_CAP  64000
+// struct to define a flow
+typedef struct {
+	char src_ip[MAX_IP_LEN];
+	int src_port;
+	char dst_ip[MAX_IP_LEN];
+	int dst_port;
+} Connection; 
 
-#define MAX_LINE_LEN     256
-#define INITIAL_HEAP_CAP 1024
-#define HASH_SIZE        1024
-#define LINK_RATE        1.0  // 1 byte per time unit
+//packet struck from each flow 
+typedef struct {
+	long long arrival_time;
+	char src_ip[MAX_IP_LEN];
+	int src_port;
+	char dst_ip[MAX_IP_LEN];
+	int dst_port;
+	int length;
+	double weight;
+	int has_weight;
+	char original_line[LINE_BUFFER_SZ];
 
- // Helper function for string duplication (cross-platform)
-static char* my_strdup(const char* s) {
+	// WFQ specific fields
+	double virtual_start_time;
+	double virtual_finish_time;
+	int connection_id;
+	int appearance_order;
+	char is_on_bus;
+} Packet;
+
+typedef struct {
+	Connection flow;
+	double weight;
+	double virtual_finish_time;
+	int appearance_order;
+	int active;
+} ConnectionInfo;
+
+typedef struct {
+	Packet *packets;
+	int count;
+	int capacity;
+} PacketQueue;
+
+// Global state
+ConnectionInfo connections[MAX_FLOWS];
+int num_connections = 0;
+double virtual_time = 0.0;
+double next_departure_time = 0; // Represents when the server becomes free next
+PacketQueue pending_packets = { NULL, 0, 0 };
+PacketQueue ready_queue = { NULL, 0, 0 };
+PacketQueue virtual_bus = { NULL, 0, 0 };
+double last_virtual_change = 0.0;
+double current_time = 0.0;
+char is_packet_on_bus = 0;
+int packet_on_bus_idx = 0;
+int should_remove_from_virtual_bus = 0;
+long long next_virtual_end = 0;
+int Debug = 0;
+
+// Function prototypes
+int find_or_create_connection(const char* src_ip, int src_port, const char* dst_ip, int dst_port, int appearance_order);
+void parse_packet(const char* line, Packet* packet, int appearance_order);
+void add_packet_to_queue(PacketQueue* queue, const Packet* packet);
+void remove_packet_from_queue(PacketQueue* queue, int index);
+int compare_packets_by_arrival_time(const void* a, const void* b);
+void schedule_next_packet();
+void init_packet_queue(PacketQueue* queue);
+void cleanup();
+char* my_strdup(const char* s);
+double sum_Active_weights();
+
+int find_packet_by_appearance(PacketQueue *queue, int appearance_order);
+
+// Helper function to duplicate string (portable strdup)
+int find_packet_by_appearance(PacketQueue *queue, int appearance_order) {
+	for (int i = 0; i < queue->count; i++) {
+		if (queue->packets[i].appearance_order == appearance_order) {
+			return i;
+		}
+	}
+	return -1;
+}
+
+double sum_Active_weights() {
+	int num_active_ids = 0;
+	int active_conn_ids[MAX_FLOWS] = { 0 };
+	double current_weight_sum = 0;
+	for (int i = 0; i < virtual_bus.count; i++) {
+		int conn_id = virtual_bus.packets[i].connection_id;
+		int found = 0;
+		for (int k = 0; k < num_active_ids; ++k) {
+			if (active_conn_ids[k] == conn_id) {
+				found = 1;
+				break;
+			}
+		}
+		if (!found) {
+			current_weight_sum += virtual_bus.packets[i].weight;
+			active_conn_ids[num_active_ids++] = conn_id;
+		}
+	}
+	return current_weight_sum;
+}
+char* my_strdup(const char* s) {
 	size_t len = strlen(s) + 1;
 	char* copy = malloc(len);
 	if (copy) {
@@ -27,467 +119,252 @@ static char* my_strdup(const char* s) {
 	return copy;
 }
 
-//-------------------------------------------------------------------------
-// Packet structure
-//-------------------------------------------------------------------------
-typedef struct Packet {
-	double arrival_time;
-	size_t length_bytes;
-	double weight;
-	double finish_vtime;    // GPS virtual finish time
-	int flow_priority;      // For tie-breaking (order of first flow appearance)
-	char *original_line;
-} Packet;
-
-//-------------------------------------------------------------------------
-// Flow key: identifies a flow by its 4-tuple
-//-------------------------------------------------------------------------
-typedef struct {
-	uint32_t src_ip, dst_ip;
-	uint16_t src_port, dst_port;
-} FlowKey;
-
-//-------------------------------------------------------------------------
-// Per-flow state
-//-------------------------------------------------------------------------
-typedef struct {
-	double last_finish;       // finish tag of last packet in virtual time
-	double weight;            // current flow weight
-	int    backlog_count;     // number of packets enqueued
-	int    priority;          // flow priority (order of first appearance)
-	int    in_heap;
-} FlowState;
-
-//-------------------------------------------------------------------------
-// Hash table entry for flow states
-//-------------------------------------------------------------------------
-typedef struct FlowEntry {
-	FlowKey key;
-	FlowState state;
-	struct FlowEntry *next;
-} FlowEntry;
-static FlowEntry *flow_table[HASH_SIZE] = { 0 };
-
-//-------------------------------------------------------------------------
-// Global state
-//-------------------------------------------------------------------------
-double current_time = 0.0;      // Current real time
-double V = 0.0;                  // Virtual time
-double W_active = 0.0;           // Sum of weights of backlogged flows
-int next_flow_priority = 0;      // For assigning flow priorities
-
-//-------------------------------------------------------------------------
-// Min-heap for pending packets (ordered by finish virtual time)
-//-------------------------------------------------------------------------
-static Packet **heap = NULL;
-static size_t heap_size = 0, heap_cap = 0;
-
-//-------------------------------------------------------------------------
-// Function prototypes (to fix declaration order issues)
-//-------------------------------------------------------------------------
-static FlowKey extract_flow_key(const char *line);
-
-//-------------------------------------------------------------------------
-// Utility functions
-//-------------------------------------------------------------------------
-static uint32_t ip_to_uint(const char *s) {
-	int a, b, c, d;
-	if (sscanf(s, "%d.%d.%d.%d", &a, &b, &c, &d) != 4) return 0;
-	return ((uint32_t)a << 24) | ((uint32_t)b << 16) | ((uint32_t)c << 8) | (uint32_t)d;
+// Comparison function for qsort
+int compare_packets_by_arrival_time(const void* a, const void* b) {
+	const Packet* pa = (const Packet*)a;
+	const Packet* pb = (const Packet*)b;
+	if (pa->arrival_time < pb->arrival_time) return -1;
+	if (pa->arrival_time > pb->arrival_time) return 1;
+	return pa->appearance_order - pb->appearance_order;
 }
 
-static unsigned long flow_hash(const FlowKey *k) {
-	uint64_t h = ((uint64_t)k->src_ip << 32) ^ k->dst_ip
-		^ ((uint32_t)k->src_port << 16) ^ k->dst_port;
-	return (unsigned long)(h % HASH_SIZE);
+int compare_packets_by_virtual_finish_time(const void* a, const void* b) {
+	const Packet* pa = (const Packet*)a;
+	const Packet* pb = (const Packet*)b;
+	if (pa->virtual_finish_time < pb->virtual_finish_time) return -1;
+	if (pa->virtual_finish_time > pb->virtual_finish_time) return 1;
+	return pa->appearance_order - pb->appearance_order;
 }
 
-
-static int flow_eq(const FlowKey *a, const FlowKey *b) {
-	return a->src_ip == b->src_ip && a->dst_ip == b->dst_ip
-		&& a->src_port == b->src_port && a->dst_port == b->dst_port;
+void init_packet_queue(PacketQueue* queue) {
+	queue->capacity = BUF_INITIAL_CAP ;
+	queue->packets = malloc(queue->capacity * sizeof(Packet));
+	queue->count = 0;
 }
 
-//-------------------------------------------------------------------------
-// Flow state management
-//-------------------------------------------------------------------------
-static FlowState *get_flow_state(const FlowKey *key) {
-	unsigned long idx = flow_hash(key);
-	for (FlowEntry *e = flow_table[idx]; e; e = e->next) {
-		if (flow_eq(&e->key, key)) return &e->state;
-	}
-	FlowEntry *e = calloc(1, sizeof(*e));  // Use calloc to zero-initialize
-	if (!e) { perror("calloc"); exit(EXIT_FAILURE); }
-	e->key = *key;
-	e->state.last_finish = 0.0;
-	e->state.weight = 1.0;
-	e->state.backlog_count = 0;
-	e->state.priority = next_flow_priority++;
-	e->next = flow_table[idx];
-	flow_table[idx] = e;
-	e->state.in_heap = 0;
-
-	return &e->state;
-}
-
-//-------------------------------------------------------------------------
-// Heap operations with proper tie-breaking for WFQ
-//-------------------------------------------------------------------------
-static void heap_swap(Packet **a, Packet **b) {
-	Packet *tmp = *a; *a = *b; *b = tmp;
-}
-
-static int packet_compare(const Packet *a, const Packet *b) {
-	// Primary: finish virtual time (most important for WFQ)
-	if (a->finish_vtime < b->finish_vtime) return -1;
-	if (a->finish_vtime > b->finish_vtime) return 1;
-
-	// Secondary: flow priority (for same finish times, earlier flows win)
-	if (a->flow_priority < b->flow_priority) return -1;
-	if (a->flow_priority > b->flow_priority) return 1;
-
-	// Tertiary: arrival time (earlier arrivals win)
-	if (a->arrival_time < b->arrival_time) return -1;
-	if (a->arrival_time > b->arrival_time) return 1;
-
-	return 0;
-}
-
-static void heapify_up(size_t i) {
-	while (i > 0) {
-		size_t p = (i - 1) / 2;
-		if (packet_compare(heap[i], heap[p]) < 0) {
-			heap_swap(&heap[i], &heap[p]);
-			i = p;
-		}
-		else break;
-	}
-}
-
-static void heapify_down(size_t i) {
-	for (;;) {
-		size_t l = 2 * i + 1, r = 2 * i + 2, smallest = i;
-
-		if (l < heap_size && packet_compare(heap[l], heap[smallest]) < 0) {
-			smallest = l;
-		}
-
-		if (r < heap_size && packet_compare(heap[r], heap[smallest]) < 0) {
-			smallest = r;
-		}
-
-		if (smallest != i) {
-			heap_swap(&heap[i], &heap[smallest]);
-			i = smallest;
-		}
-		else break;
-	}
-}
-
-static void heap_push(Packet *p) {
-	if (heap_size >= heap_cap) {
-		heap_cap = heap_cap ? heap_cap * 2 : INITIAL_HEAP_CAP;
-		heap = realloc(heap, heap_cap * sizeof(*heap));
-		if (!heap) { perror("realloc"); exit(EXIT_FAILURE); }
-	}
-	heap[heap_size] = p;
-	heapify_up(heap_size++);
-}
-
-// Rebuilds the heap to restore the min-heap property
-static void heap_rebuild(void) {
-	if (heap_size == 0) return;
-
-	// Start from the last parent node and heapify down
-	for (size_t i = (heap_size / 2); i-- > 0;) {
-		heapify_down(i);
-	}
-}
-
-
-
-// Checks whether the min-heap property is preserved; if not, fixes the heap
-static void heap_validate_and_fix(void) {
-	int issues = 0;
-	for (size_t i = 0; i < heap_size; i++) {
-		size_t l = 2 * i + 1, r = 2 * i + 2;
-
-		if (l < heap_size && packet_compare(heap[l], heap[i]) < 0) {
-			fprintf(stderr, "Heap violation: parent[%zu] > left[%zu]\n", i, l);
-			issues = 1;
-		}
-		if (r < heap_size && packet_compare(heap[r], heap[i]) < 0) {
-			fprintf(stderr, "Heap violation: parent[%zu] > right[%zu]\n", i, r);
-			issues = 1;
+int find_or_create_connection(const char* src_ip, int src_port, const char* dst_ip, int dst_port, int appearance_order) {
+	// Look for existing connection
+	for (int i = 0; i < num_connections; i++) {
+		if (strcmp(connections[i].flow.src_ip, src_ip) == 0 &&
+			connections[i].flow.src_port == src_port &&
+			strcmp(connections[i].flow.dst_ip, dst_ip) == 0 &&
+			connections[i].flow.dst_port == dst_port) {
+			return i;
 		}
 	}
-	if (issues) {
-		fprintf(stderr, "Heap violations found — fixing heap...\n");
-		heap_rebuild();
+
+	// Create new connection
+	if (num_connections >= MAX_FLOWS) {
+		fprintf(stderr, "Too many connections\n");
+		exit(1);
 	}
-	else {
-		fprintf(stderr, "Heap is valid.\n");
-	}
+
+	int id = num_connections++;
+	strcpy(connections[id].flow.src_ip, src_ip);
+	connections[id].flow.src_port = src_port;
+	strcpy(connections[id].flow.dst_ip, dst_ip);
+	connections[id].flow.dst_port = dst_port;
+	connections[id].weight = 1; // Default weight - THIS MUST BE 1
+	connections[id].virtual_finish_time = 0.0;
+	connections[id].appearance_order = appearance_order;
+	connections[id].active = 0;
+
+	return id;
 }
 
+void parse_packet(const char* line, Packet* packet, int appearance_order) {
+	strcpy(packet->original_line, line);
+	packet->appearance_order = appearance_order;
+	packet->has_weight = 0;
+	packet->is_on_bus = 0;
 
+	char* line_copy = my_strdup(line);
+	char* token = strtok(line_copy, " ");
+	int field = 0;
 
-static Packet *heap_pop(void) {
-	if (!heap_size) return NULL;
-	Packet *top = heap[0];
-	heap[0] = heap[--heap_size];
-	if (heap_size > 0) heapify_down(0);
-
-	return top;
-}
-
-//-------------------------------------------------------------------------
-// Extract flow key from packet line
-//-------------------------------------------------------------------------
-static FlowKey extract_flow_key(const char *line) {
-	char src_str[16], dst_str[16];
-	int sp, dp;
-	sscanf(line, "%*lf %15s %d %15s %d", src_str, &sp, dst_str, &dp);
-
-	FlowKey key;
-	key.src_ip = ip_to_uint(src_str);
-	key.dst_ip = ip_to_uint(dst_str);
-	key.src_port = (uint16_t)sp;
-	key.dst_port = (uint16_t)dp;
-	return key;
-}
-
-// Recalculate finish_vtime for all packets in the heap using latest V and flow state
-static void recalculate_all_finish_vtimes(void) {
-	for (size_t i = 0; i < heap_size; i++) {
-		Packet *p = heap[i];
-		FlowKey key = extract_flow_key(p->original_line);
-		FlowState *fs = get_flow_state(&key);
-
-		double start_vtime = (fs->last_finish > V) ? fs->last_finish : V;
-		p->finish_vtime = start_vtime + (double)p->length_bytes / fs->weight;
-	}
-	heap_rebuild();  // Reorder heap based on new finish_vtime values
-}
-
-
-//-------------------------------------------------------------------------
-// Update virtual time based on elapsed real time and active weight
-//-------------------------------------------------------------------------
-static void advance_virtual_time_to(double target_time) {
-	if (target_time <= current_time || W_active <= 0.0) return;
-
-	// Ensure we advance from the current round(t), not a possibly stale V
-	double elapsed = target_time - current_time;
-	V = V + elapsed / W_active;  // round(t + x) = round(t) + x/W
-	current_time = target_time;
-}
-
-
-// For departures: update both virtual time and real time
-static void advance_time_to(double new_time) {
-	if (new_time > current_time) {
-		if (W_active > 0.0) {
-			V += (new_time - current_time) / W_active;
+	while (token != NULL) {
+		switch (field) {
+		case 0: packet->arrival_time = atoll(token); break;
+		case 1: strcpy(packet->src_ip, token); break;
+		case 2: packet->src_port = atoi(token); break;
+		case 3: strcpy(packet->dst_ip, token); break;
+		case 4: packet->dst_port = atoi(token); break;
+		case 5: packet->length = atoi(token); break;
+		case 6:
+			packet->weight = atof(token);
+			packet->has_weight = 1;
+			break;
 		}
-		current_time = new_time;
+		field++;
+		token = strtok(NULL, " ");
 	}
+
+	free(line_copy);
+
+
+
 }
 
-//-------------------------------------------------------------------------
-// Debug function to show heap contents
-//-------------------------------------------------------------------------
-static void debug_heap_contents(const char* when) {
-	printf("HEAP_DEBUG %s (time=%.0f, heap_size=%d):\n", when, current_time, (int)heap_size);
-	for (int i = 0; i < (int)heap_size && i < 10; i++) {  // Show top 10 packets
-		printf("  [%d] arrival=%.0f, finish_vtime=%.6f, priority=%d\n",
-			i, heap[i]->arrival_time, heap[i]->finish_vtime, heap[i]->flow_priority);
+void add_packet_to_queue(PacketQueue* queue, const Packet* packet) {
+	if (queue->count >= queue->capacity) {
+		queue->capacity *= 2;
+		queue->packets = realloc(queue->packets, queue->capacity * sizeof(Packet));
 	}
+	queue->packets[queue->count++] = *packet;
 }
 
-//-------------------------------------------------------------------------
-// Input parsing
-//-------------------------------------------------------------------------
-static Packet *read_one_packet(void) {
-	char line[MAX_LINE_LEN];
+void remove_packet_from_queue(PacketQueue* queue, int index) {
+
+	for (int i = index; i < queue->count - 1; i++) {
+		queue->packets[i] = queue->packets[i + 1];
+	}
+	queue->count--;
+}
+
+void schedule_next_packet() {
+	if (ready_queue.count == 0) return;
+
+	const double EPS = 1e-9;   // tolerance for almost-equal VFTs
+
+	int best_idx = 0;
+	for (int i = 1; i < ready_queue.count; i++) {
+		if (ready_queue.packets[i].is_on_bus == 0) {
+			double diff = ready_queue.packets[i].virtual_finish_time -
+				ready_queue.packets[best_idx].virtual_finish_time;
+
+			if (diff < -EPS ||                            /* clearly smaller VFT          */
+				(fabs(diff) <= EPS &&                   /* virtually equal → tie-break  */
+					connections[ready_queue.packets[i].connection_id].appearance_order <
+					connections[ready_queue.packets[best_idx].connection_id].appearance_order)) {
+				best_idx = i;
+			}
+		}
+	}
+	ready_queue.packets[best_idx].is_on_bus = 1;
+	Packet packet_to_send = ready_queue.packets[best_idx];
+	//remove_packet_from_queue(&ready_queue, best_idx);
+	is_packet_on_bus = 1;
+	//packet_on_bus_idx = best_idx;
+	remove_packet_from_queue(&ready_queue, best_idx);
+
+
+
+	// Determine actual start time for this packet
+	// real_time currently holds when the server *became free* from the *previous* transmission (or 0 if idle)
+	long long actual_start_time = (next_departure_time > packet_to_send.arrival_time) ? next_departure_time : packet_to_send.arrival_time;
+
+	// Original output format restored
+	printf("%lld: %s\n", actual_start_time, packet_to_send.original_line);
+
+
+
+	// Update virtual time
+	// Calculate weight sum of connections that were in ready_queue *before* this packet was removed
+	double current_weight_sum = 0;
+
+	// Update server's next free time
+	next_departure_time = actual_start_time + packet_to_send.length;
+}
+
+
+void cleanup() {
+	if (pending_packets.packets) free(pending_packets.packets);
+	if (ready_queue.packets) free(ready_queue.packets);
+	if (virtual_bus.packets) free(virtual_bus.packets);
+}
+
+int main() {
+	char line[LINE_BUFFER_SZ];
+	int appearance_order = 0;
+	init_packet_queue(&pending_packets);
+	init_packet_queue(&ready_queue);
+	init_packet_queue(&virtual_bus);
+	// init_packet_queue(&to_leave_virtual_bus);
 	while (fgets(line, sizeof(line), stdin)) {
-		size_t len = strlen(line);
-		if (len <= 1) continue;  // Skip empty lines
-		if (line[len - 1] == '\n') line[len - 1] = '\0';
-
-		double t, w_in = 1.0;
-		char src[16], dst[16];
-		int sp, dp;
-		size_t plen;
-
-		int n = sscanf(line, "%lf %15s %d %15s %d %zu %lf",
-			&t, src, &sp, dst, &dp, &plen, &w_in);
-
-		if (n < 6) continue;  // Skip malformed lines
-
-		Packet *p = calloc(1, sizeof(*p));  // Use calloc to zero-initialize
-		if (!p) { perror("calloc"); exit(EXIT_FAILURE); }
-
-		p->arrival_time = t;
-		p->length_bytes = plen;
-		p->weight = (n >= 7) ? w_in : 1.0;
-		p->flow_priority = 0;  // Explicitly initialize
-		p->finish_vtime = 0.0; // Explicitly initialize
-		p->original_line = my_strdup(line);
-
-		return p;
-	}
-	return NULL;
-}
-
-//-------------------------------------------------------------------------
-// Main simulation
-//-------------------------------------------------------------------------
-int main(void) {
-	int debugx = 0;
-	current_time = 0.0;
-	V = 0.0;
-	W_active = 0.0;
-	next_flow_priority = 0;
-
-	Packet *next_arrival = read_one_packet();
-	//printf("packet content %.0f\n", next_arrival->arrival_time);
-
-	while (next_arrival || heap_size > 0) {
-
-		double next_arrival_time = next_arrival ? next_arrival->arrival_time : 1e9; //check if there are any new arrivals, if not handle departures from heap
-
-		// Decide whether to process arrival or departure
-		// Find next possible departure time
-		double next_departure_time = 1e9;
-
-		if (heap_size > 0) {
-			//heap_validate_and_fix();
-			next_departure_time = (current_time > heap[0]->arrival_time) ? //handles case where the packet was delayed and is transmitted in later time then in the input
-				current_time : heap[0]->arrival_time;
-		}
-
-		if (next_arrival &&
-			(heap_size == 0 || next_arrival_time < next_departure_time)) {
-
-			// === ARRIVAL EVENT ===
-			double arrival_time = next_arrival_time;
-
-			// DEBUG: Track specific packets we're interested in
-			//if (arrival_time == 47971 || arrival_time == 48283) {
-			//	printf("TRACK: Packet %.0f ARRIVING\n", arrival_time);
-		//	}
-
-			// Extract flow information FIRST
-			FlowKey key = extract_flow_key(next_arrival->original_line);
-			FlowState *fs = get_flow_state(&key);
-
-			// Store the virtual time BEFORE we advance it
-			double gps_arrival_vtime = V;
-
-			// Now update virtual time to arrival time
-			advance_virtual_time_to(arrival_time);
-
-			// Add flow to active set if it wasn't backlogged
-			if (fs->backlog_count == 0) {
-				W_active += fs->weight;
-			}
-
-			// Increment backlog count
-			fs->backlog_count++;
-
-			// Update flow weight if packet specifies one (affects FUTURE packets)
-			if (next_arrival->weight != 1.0) {
-				// Adjust W_active for the weight change
-				W_active = W_active - fs->weight + next_arrival->weight;
-				fs->weight = next_arrival->weight;
-			}
-
-			// Calculate GPS virtual finish time
-			next_arrival->flow_priority = fs->priority;
-
-			/*double start_vtime = (fs->last_finish > gps_arrival_vtime) ? fs->last_finish : gps_arrival_vtime;
-			next_arrival->finish_vtime = start_vtime + (double)next_arrival->length_bytes / fs->weight;
-			fs->last_finish = next_arrival->finish_vtime;*/
-
-			double start_vtime = (fs->last_finish > gps_arrival_vtime) ? fs->last_finish : gps_arrival_vtime;
-			next_arrival->finish_vtime = start_vtime + (double)next_arrival->length_bytes / fs->weight;
-			fs->last_finish = next_arrival->finish_vtime;
-			// Add to heap (will be sorted by finish time with proper tie-breaking)
-			//heap_push(next_arrival);
-			if (!fs->in_heap) {
-				heap_push(next_arrival);
-				fs->in_heap = 1;
-				
-			}
-
-
-
-			// Show heap contents around problem time
-
-			// Read next packet
-			next_arrival = read_one_packet();
-			//debug_heap_contents("after_arrival");
-
-			//printf("packet content %.0f\n", next_arrival->arrival_time);
-
-		}
-		else if (heap_size > 0) {
-			// === DEPARTURE EVENT ===
-
-			// Show heap contents before selecting packet
-			if (debugx == 1) {
-				debug_heap_contents("before_recalculation");
-			}
-
-			recalculate_all_finish_vtimes();
-
-			//debug_heap_contents("before_departure");
-
-			// Get packet with earliest finish time (WFQ scheduling)
-			Packet *departing = heap_pop();
-
-
-			// Ensure we don't start transmission before packet arrives
-			if (current_time < departing->arrival_time) {
-				advance_time_to(departing->arrival_time);
-			}
-
-			// Output packet with its transmission start time
-			printf("%d: %s\n", (int)round(current_time), departing->original_line);
-			//printf("DEBUG: arrival_time=%.0f, weight=%.2f, virtual_time=%.6f\n",
-				//departing->arrival_time, departing->weight, V);
-
-			// Advance current time by transmission duration
-			current_time += (double)departing->length_bytes / LINK_RATE;
-
-			// Update flow state
-			FlowKey key = extract_flow_key(departing->original_line);
-			FlowState *fs = get_flow_state(&key);
-			fs->backlog_count--;
-
-			// Check if flow becomes inactive
-			if (fs->backlog_count == 0) {
-				W_active -= fs->weight;
-			}
-			fs->in_heap = 0;
-			// Cleanup
-			free(departing->original_line);
-			free(departing);
-		}
+		line[strcspn(line, "\n")] = 0;
+		if (strlen(line) == 0) continue;
+		Packet packet;
+		parse_packet(line, &packet, appearance_order++);
+		add_packet_to_queue(&pending_packets, &packet);
 	}
 
-	// Cleanup
-	free(heap);
+	qsort(pending_packets.packets, pending_packets.count, sizeof(Packet), compare_packets_by_arrival_time);
 
-	for (int i = 0; i < HASH_SIZE; i++) {
-		FlowEntry *e = flow_table[i];
-		while (e) {
-			FlowEntry *next = e->next;
-			free(e);
-			e = next;
+	while (pending_packets.count > 0 || ready_queue.count > 0) {
+		long long next_arrival_event_time = (pending_packets.count > 0) ? pending_packets.packets[0].arrival_time : LLONG_MAX;
+
+		if (ready_queue.count == 0 && next_arrival_event_time == LLONG_MAX) {
+			break;
 		}
+		current_time = next_arrival_event_time;
+		if (next_departure_time < current_time && is_packet_on_bus) { //&& is_packet_on_bus) {
+			current_time = next_departure_time;
+		}
+		if (virtual_bus.count != 0) {
+			double virtual_finish = virtual_bus.packets[0].virtual_finish_time;
+			double real_finish_virtual = last_virtual_change + (virtual_finish - virtual_time) * sum_Active_weights();
+			if (real_finish_virtual < current_time) {
+				current_time = real_finish_virtual;
+				should_remove_from_virtual_bus = 1; // will remove later, need to take into account when computing virtual
+			}
+		}
+
+
+
+
+		if (current_time == DBL_MAX) break;
+
+		double weight_sum = sum_Active_weights();
+		if (weight_sum > 0) {
+			virtual_time += (double)(current_time - last_virtual_change) / weight_sum;
+		}
+		last_virtual_change = current_time;
+		// }
+		if (should_remove_from_virtual_bus) {
+			should_remove_from_virtual_bus = 0;
+			remove_packet_from_queue(&virtual_bus, 0);
+		}
+
+		if (current_time >= next_departure_time && is_packet_on_bus == 1) {
+			is_packet_on_bus = 0;
+		}
+		// Process all packets that have arrived by this current_time
+		if (pending_packets.count > 0 && pending_packets.packets[0].arrival_time <= current_time) {
+			Packet packet = pending_packets.packets[0];
+			// Find or create connection
+			packet.connection_id = find_or_create_connection(packet.src_ip, packet.src_port,
+				packet.dst_ip, packet.dst_port,
+				appearance_order);
+			remove_packet_from_queue(&pending_packets, 0);
+
+			int conn_id = packet.connection_id;
+			double last_conn_vft = connections[conn_id].virtual_finish_time;
+
+			double virtual_start = (virtual_time > last_conn_vft) ? virtual_time : last_conn_vft;
+
+			packet.virtual_start_time = virtual_start;
+			if (packet.has_weight) {
+				connections[conn_id].weight = packet.weight;
+			}
+			else { packet.weight = connections[conn_id].weight; } //if packet does not have a specified weight, take the connection's at the time
+			packet.virtual_finish_time = virtual_start + (double)packet.length / connections[conn_id].weight;
+		
+			connections[conn_id].virtual_finish_time = packet.virtual_finish_time;
+
+			add_packet_to_queue(&ready_queue, &packet);
+			add_packet_to_queue(&virtual_bus, &packet);
+			qsort(virtual_bus.packets, virtual_bus.count, sizeof(Packet), compare_packets_by_virtual_finish_time);
+		}
+
+
+		if (ready_queue.count > 0 && next_departure_time <= current_time && is_packet_on_bus == 0) {// && is_packet_on_bus == 0) { //was && real_time <= current_time
+			schedule_next_packet(current_time);
+		}
+
+
+
 	}
 
+	cleanup();
 	return 0;
 }
